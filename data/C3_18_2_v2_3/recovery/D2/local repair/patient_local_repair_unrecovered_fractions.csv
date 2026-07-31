@@ -1,0 +1,18 @@
+patient,fraction,machine,day,window,duration_minutes,priority,earliest_start_day,target_day,is_preferred_machine,scenario_id,scenario_name,recovery_status,patient_local_status
+81,19,9,24,2,12,1,6,8,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+88,19,9,24,2,12,1,6,8,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+116,16,9,24,2,12,1,9,11,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+121,16,9,24,2,12,1,9,11,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+135,14,9,24,2,12,1,11,13,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+136,14,9,24,2,12,1,11,13,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+171,11,9,24,2,12,1,14,16,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+172,11,9,24,2,12,1,14,16,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+176,11,9,24,2,12,1,14,16,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+186,9,9,24,2,12,1,16,18,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+192,8,9,24,2,12,1,17,19,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+213,6,9,24,2,12,1,19,21,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+228,4,9,24,2,12,1,21,23,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+245,1,9,24,2,24,1,24,26,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+250,1,9,24,2,24,1,24,26,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+155,12,9,24,2,12,2,13,27,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered
+167,11,9,24,2,12,2,14,28,True,D2_machine_full_day,Unexpected LINAC failure starting in treatment window 1 and persisting through the end of the day,unrecovered_no_recovery,unrecovered

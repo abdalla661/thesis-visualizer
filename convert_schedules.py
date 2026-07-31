@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import copy
 from pathlib import Path
 from typing import Any
+import re
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -14,9 +15,8 @@ from config import ROOT_DIR, baseline_paths, ensure_generated_directories
 DAY_SHEET_PREFIX = "Day "
 MACHINE_COUNT = 10
 WINDOW_COUNT = 4
-ROWS_PER_MACHINE = 12
-FIRST_SCHEDULE_ROW = 6
 FIRST_WINDOW_COLUMN = 2  # B
+MACHINE_LABEL_RE = re.compile(r"^M(\d+)$", re.IGNORECASE)
 
 REQUIRED_COLUMNS = {
     "patient",
@@ -114,7 +114,160 @@ def _apply_style(style, target) -> None:
     target._style = copy(style)
 
 
-def _find_style_cells(workbook) -> dict[str, Any]:
+def _detect_machine_blocks(worksheet) -> dict[int, tuple[int, int]]:
+    """
+    Detect machine row blocks from labels in column A.
+
+    Returns:
+        {machine_number: (first_row, last_row)}
+    """
+    machine_starts: list[tuple[int, int]] = []
+
+    for row in range(1, worksheet.max_row + 1):
+        value = worksheet.cell(row=row, column=1).value
+        if not isinstance(value, str):
+            continue
+
+        match = MACHINE_LABEL_RE.fullmatch(value.strip())
+        if match:
+            machine_starts.append((int(match.group(1)), row))
+
+    if not machine_starts:
+        raise ValueError(
+            f"No machine labels were found in worksheet '{worksheet.title}'."
+        )
+
+    machine_starts.sort(key=lambda item: item[1])
+    blocks: dict[int, tuple[int, int]] = {}
+
+    for index, (machine, start_row) in enumerate(machine_starts):
+        if index + 1 < len(machine_starts):
+            end_row = machine_starts[index + 1][1] - 1
+        else:
+            end_row = worksheet.max_row
+
+        if end_row < start_row:
+            raise ValueError(
+                f"Invalid row block for M{machine} in worksheet "
+                f"'{worksheet.title}'."
+            )
+
+        blocks[machine] = (start_row, end_row)
+
+    return blocks
+
+
+def _window_count_for_instance(instance_id: str) -> int:
+    """
+    Extract the window count from names such as:
+      C3_18_2_v2_3 -> 2
+      C2_18_4_v2_9 -> 4
+    """
+    match = re.match(r"^[^_]+_\d+_(\d+)(?:_|$)", instance_id.strip())
+    if not match:
+        raise ValueError(
+            f"Could not determine window count from instance ID "
+            f"'{instance_id}'."
+        )
+
+    window_count = int(match.group(1))
+    if window_count not in {2, 4}:
+        raise ValueError(
+            f"Unsupported window count {window_count} in instance ID "
+            f"'{instance_id}'. Expected 2 or 4."
+        )
+
+    return window_count
+
+
+
+
+def _expand_machine_blocks_for_day(
+    worksheet,
+    day_schedule: pd.DataFrame,
+    window_count: int,
+) -> dict[int, tuple[int, int]]:
+    """Expand template machine blocks when a day needs extra appointment rows.
+
+    Rows are inserted from the bottom machine upward so later machine blocks are
+    shifted safely. Machine labels in column A are then re-merged over their
+    new block heights.
+    """
+    machine_blocks = _detect_machine_blocks(worksheet)
+
+    required_rows: dict[int, int] = {}
+    for machine, (block_start, block_end) in machine_blocks.items():
+        machine_schedule = day_schedule[day_schedule["machine"] == machine]
+        required = 1
+        for window in range(1, window_count + 1):
+            required = max(
+                required,
+                int((machine_schedule["window"] == window).sum()),
+            )
+        required_rows[machine] = required
+
+    expansions = {
+        machine: required_rows[machine] - (block_end - block_start + 1)
+        for machine, (block_start, block_end) in machine_blocks.items()
+        if required_rows[machine] > (block_end - block_start + 1)
+    }
+
+    if not expansions:
+        return machine_blocks
+
+    min_schedule_row = min(start for start, _ in machine_blocks.values())
+    max_schedule_row = max(end for _, end in machine_blocks.values())
+
+    # Unmerge all schedule-body ranges before row insertion. openpyxl does not
+    # reliably resize merged ranges when inserting rows.
+    for merged_range in list(worksheet.merged_cells.ranges):
+        if (
+            merged_range.max_row >= min_schedule_row
+            and merged_range.min_row <= max_schedule_row
+            and merged_range.min_col <= FIRST_WINDOW_COLUMN + 3
+        ):
+            worksheet.unmerge_cells(str(merged_range))
+
+    # Insert from bottom to top so previously calculated start rows remain valid.
+    for machine, extra_rows in sorted(
+        expansions.items(),
+        key=lambda item: machine_blocks[item[0]][0],
+        reverse=True,
+    ):
+        block_start, block_end = machine_blocks[machine]
+        insert_at = block_end + 1
+        source_row = block_end
+        source_height = worksheet.row_dimensions[source_row].height
+
+        worksheet.insert_rows(insert_at, amount=extra_rows)
+
+        for new_row in range(insert_at, insert_at + extra_rows):
+            worksheet.row_dimensions[new_row].height = source_height
+            for column in range(1, worksheet.max_column + 1):
+                source_cell = worksheet.cell(source_row, column)
+                target_cell = worksheet.cell(new_row, column)
+                target_cell._style = copy(source_cell._style)
+                if source_cell.has_style:
+                    target_cell.number_format = source_cell.number_format
+                target_cell.value = None
+
+    expanded_blocks = _detect_machine_blocks(worksheet)
+
+    # Restore the machine-label merges over the expanded row blocks.
+    for machine, (block_start, block_end) in expanded_blocks.items():
+        label_cell = worksheet.cell(block_start, 1)
+        if not label_cell.value:
+            label_cell.value = f"M{machine}"
+        worksheet.merge_cells(
+            start_row=block_start,
+            start_column=1,
+            end_row=block_end,
+            end_column=1,
+        )
+
+    return expanded_blocks
+
+def _find_style_cells(workbook, window_count: int) -> dict[str, Any]:
     """Find reusable appointment, empty, and neutral slot styles."""
     styles: dict[str, Any] = {}
     neutral_by_offset: dict[int, Any] = {}
@@ -125,29 +278,39 @@ def _find_style_cells(workbook) -> dict[str, Any]:
         "00F4CCCC": "priority_3",
         "00E7E6E6": "empty",
     }
-
-    schedule_last_row = FIRST_SCHEDULE_ROW + MACHINE_COUNT * ROWS_PER_MACHINE - 1
+    appointment_fill_colors = set(fill_to_key)
 
     for sheet_name in workbook.sheetnames:
         if not sheet_name.startswith(DAY_SHEET_PREFIX):
             continue
+
         worksheet = workbook[sheet_name]
+        machine_blocks = _detect_machine_blocks(worksheet)
 
-        for row in range(FIRST_SCHEDULE_ROW, schedule_last_row + 1):
-            offset = (row - FIRST_SCHEDULE_ROW) % ROWS_PER_MACHINE
-            for column in range(FIRST_WINDOW_COLUMN, FIRST_WINDOW_COLUMN + WINDOW_COUNT):
-                cell = worksheet.cell(row, column)
-                rgb = cell.fill.fgColor.rgb
+        for _, (block_start, block_end) in machine_blocks.items():
+            for row in range(block_start, block_end + 1):
+                offset = row - block_start
 
-                key = fill_to_key.get(rgb)
-                if key and key not in styles:
-                    styles[key] = copy(cell._style)
+                for column in range(
+                    FIRST_WINDOW_COLUMN,
+                    FIRST_WINDOW_COLUMN + window_count,
+                ):
+                    cell = worksheet.cell(row=row, column=column)
+                    rgb = cell.fill.fgColor.rgb
 
-                # Neutral unused schedule cells use the very light blue fill.
-                if rgb == "00F8FAFC" and offset not in neutral_by_offset:
-                    neutral_by_offset[offset] = copy(cell._style)
+                    key = fill_to_key.get(rgb)
+                    if key and key not in styles:
+                        styles[key] = copy(cell._style)
 
-        if len(styles) == 4 and len(neutral_by_offset) == ROWS_PER_MACHINE:
+                    if (
+                        cell.fill.fill_type == "solid"
+                        and rgb
+                        and rgb not in appointment_fill_colors
+                        and offset not in neutral_by_offset
+                    ):
+                        neutral_by_offset[offset] = copy(cell._style)
+
+        if len(styles) == 4 and neutral_by_offset:
             break
 
     missing = {"priority_1", "priority_2", "priority_3", "empty"}.difference(styles)
@@ -158,17 +321,12 @@ def _find_style_cells(workbook) -> dict[str, Any]:
         )
 
     if not neutral_by_offset:
-        raise ValueError("The template does not contain a neutral schedule-cell style.")
-
-    # All unused slot rows share the same neutral style in this template.
-    # Offset 0 is normally occupied by an appointment or an EMPTY merge, so it
-    # may not exist as a neutral cell in the populated template. Reuse the first
-    # neutral style for any missing offset.
-    fallback_neutral = next(iter(neutral_by_offset.values()))
-    for offset in range(ROWS_PER_MACHINE):
-        neutral_by_offset.setdefault(offset, fallback_neutral)
+        raise ValueError(
+            "The template does not contain a neutral schedule-cell style."
+        )
 
     styles["neutral_by_offset"] = neutral_by_offset
+    styles["neutral_fallback"] = next(iter(neutral_by_offset.values()))
     return styles
 
 
@@ -185,57 +343,92 @@ def _apply_nonpreferred_border(cell) -> None:
     cell.border = Border(left=blue, right=blue, top=blue, bottom=blue)
 
 
-def _clear_day_body(worksheet, styles: dict[str, Any]) -> None:
-    """Reset the complete schedule body to the template's neutral slot style."""
-    schedule_last_row = FIRST_SCHEDULE_ROW + MACHINE_COUNT * ROWS_PER_MACHINE - 1
+def _clear_day_body(
+    worksheet,
+    styles: dict[str, Any],
+    machine_blocks: dict[int, tuple[int, int]],
+    window_count: int,
+) -> None:
+    """Reset every machine/window schedule cell to a neutral template style."""
+    min_schedule_row = min(start for start, _ in machine_blocks.values())
+    max_schedule_row = max(end for _, end in machine_blocks.values())
 
     for merged_range in list(worksheet.merged_cells.ranges):
         if (
             merged_range.min_col >= FIRST_WINDOW_COLUMN
-            and merged_range.max_col <= FIRST_WINDOW_COLUMN + WINDOW_COUNT - 1
-            and merged_range.min_row >= FIRST_SCHEDULE_ROW
-            and merged_range.max_row <= schedule_last_row
+            and merged_range.max_col <= FIRST_WINDOW_COLUMN + window_count - 1
+            and merged_range.min_row >= min_schedule_row
+            and merged_range.max_row <= max_schedule_row
         ):
             worksheet.unmerge_cells(str(merged_range))
 
     neutral_by_offset = styles["neutral_by_offset"]
-    for row in range(FIRST_SCHEDULE_ROW, schedule_last_row + 1):
-        offset = (row - FIRST_SCHEDULE_ROW) % ROWS_PER_MACHINE
-        for column in range(FIRST_WINDOW_COLUMN, FIRST_WINDOW_COLUMN + WINDOW_COUNT):
-            cell = worksheet.cell(row=row, column=column)
-            cell.value = None
-            _apply_style(neutral_by_offset[offset], cell)
+    fallback_neutral = styles["neutral_fallback"]
+
+    for _, (block_start, block_end) in machine_blocks.items():
+        for row in range(block_start, block_end + 1):
+            offset = row - block_start
+            neutral_style = neutral_by_offset.get(offset, fallback_neutral)
+
+            for column in range(
+                FIRST_WINDOW_COLUMN,
+                FIRST_WINDOW_COLUMN + window_count,
+            ):
+                cell = worksheet.cell(row=row, column=column)
+                cell.value = None
+                _apply_style(neutral_style, cell)
 
 
-def _populate_day_sheet(worksheet, day_schedule: pd.DataFrame, styles: dict[str, Any]) -> None:
-    _clear_day_body(worksheet, styles)
+def _populate_day_sheet(
+    worksheet,
+    day_schedule: pd.DataFrame,
+    styles: dict[str, Any],
+    window_count: int,
+) -> None:
+    machine_blocks = _expand_machine_blocks_for_day(
+        worksheet,
+        day_schedule,
+        window_count,
+    )
+    _clear_day_body(
+        worksheet,
+        styles,
+        machine_blocks,
+        window_count,
+    )
 
     if not day_schedule.empty:
         day_number = int(day_schedule["day"].iloc[0])
     else:
         day_number = int(worksheet.title.replace(DAY_SHEET_PREFIX, ""))
+
     worksheet["A1"] = f"DAY {day_number} — MACHINE APPOINTMENT BOARD"
 
-    # Appointment rows are 35 pt whenever at least one window uses that row.
-    for machine in range(1, MACHINE_COUNT + 1):
-        block_start = FIRST_SCHEDULE_ROW + (machine - 1) * ROWS_PER_MACHINE
-        machine_schedule = day_schedule[day_schedule["machine"] == machine]
+    for machine, (block_start, block_end) in machine_blocks.items():
+        rows_available = block_end - block_start + 1
+        machine_schedule = day_schedule[
+            day_schedule["machine"] == machine
+        ]
+
         max_appointments = 0
-        for window in range(1, WINDOW_COUNT + 1):
+        for window in range(1, window_count + 1):
             count = int((machine_schedule["window"] == window).sum())
             max_appointments = max(max_appointments, count)
+
+        if max_appointments > rows_available:
+            raise ValueError(
+                f"Day {day_number}, machine M{machine} has "
+                f"{max_appointments} appointments in one window, but the "
+                f"template block supports only {rows_available} rows."
+            )
+
         for offset in range(max_appointments):
             worksheet.row_dimensions[block_start + offset].height = 35
 
-    for machine in range(1, MACHINE_COUNT + 1):
-        block_start = FIRST_SCHEDULE_ROW + (machine - 1) * ROWS_PER_MACHINE
-        block_end = block_start + ROWS_PER_MACHINE - 1
-
-        for window in range(1, WINDOW_COUNT + 1):
+        for window in range(1, window_count + 1):
             column = FIRST_WINDOW_COLUMN + window - 1
-            appointments = day_schedule[
-                (day_schedule["machine"] == machine)
-                & (day_schedule["window"] == window)
+            appointments = machine_schedule[
+                machine_schedule["window"] == window
             ]
 
             if appointments.empty:
@@ -250,11 +443,11 @@ def _populate_day_sheet(worksheet, day_schedule: pd.DataFrame, styles: dict[str,
                 cell.value = "— EMPTY —"
                 continue
 
-            if len(appointments) > ROWS_PER_MACHINE:
+            if len(appointments) > rows_available:
                 raise ValueError(
-                    f"Day {day_number}, machine M{machine}, window {window} has "
-                    f"{len(appointments)} appointments; the template supports at most "
-                    f"{ROWS_PER_MACHINE}."
+                    f"Day {day_number}, machine M{machine}, window {window} "
+                    f"has {len(appointments)} appointments; the template "
+                    f"supports at most {rows_available}."
                 )
 
             for offset, (_, appointment) in enumerate(appointments.iterrows()):
@@ -288,8 +481,22 @@ def build_baseline_workbook(
             return output_excel
 
     schedule = _read_schedule_csv(source_csv)
+    window_count = _window_count_for_instance(instance_id)
+
+    if not schedule["window"].between(1, window_count).all():
+        invalid_windows = sorted(
+            schedule.loc[
+                ~schedule["window"].between(1, window_count),
+                "window",
+            ].unique().tolist()
+        )
+        raise ValueError(
+            f"Schedule contains windows {invalid_windows}, but instance "
+            f"'{instance_id}' is configured for {window_count} windows."
+        )
+
     workbook = load_workbook(template)
-    styles = _find_style_cells(workbook)
+    styles = _find_style_cells(workbook, window_count)
 
     available_days = sorted(schedule["day"].unique().tolist())
     for sheet_name in workbook.sheetnames:
@@ -300,7 +507,12 @@ def build_baseline_workbook(
         except ValueError:
             continue
         day_schedule = schedule[schedule["day"] == day]
-        _populate_day_sheet(workbook[sheet_name], day_schedule, styles)
+        _populate_day_sheet(
+            workbook[sheet_name],
+            day_schedule,
+            styles,
+            window_count,
+        )
 
     missing_sheets = [
         day for day in available_days if f"Day {day:02d}" not in workbook.sheetnames

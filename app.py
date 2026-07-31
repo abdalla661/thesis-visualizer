@@ -14,7 +14,6 @@ from openpyxl import load_workbook
 from config import disruptions_for, get_available_instances
 from convert_schedules import build_baseline_workbook
 
-
 st.set_page_config(
     page_title="Machine Schedule Board",
     page_icon="📅",
@@ -40,8 +39,33 @@ DAY_RE = re.compile(r"^Day\s+(\d+)$", re.IGNORECASE)
 MACHINE_RE = re.compile(r"^M\d+$", re.IGNORECASE)
 
 
+def window_count_from_instance(instance_id: str) -> int:
+    """
+    Read the number of treatment windows from an instance ID.
+
+    Expected naming pattern:
+        C3_18_2_v2_3  -> 2 windows
+        C2_18_4_v2_9  -> 4 windows
+    """
+    match = re.match(r"^[^_]+_\d+_(\d+)(?:_|$)", instance_id.strip())
+    if not match:
+        raise ValueError(
+            f"Could not determine the window count from instance ID "
+            f"'{instance_id}'. Expected a name like C3_18_2_v2_3."
+        )
+
+    window_count = int(match.group(1))
+    if window_count not in {2, 4}:
+        raise ValueError(
+            f"Unsupported window count {window_count} in instance ID "
+            f"'{instance_id}'. Expected 2 or 4."
+        )
+
+    return window_count
+
+
 @st.cache_data(show_spinner=False)
-def read_workbook(file_bytes: bytes) -> dict[str, Any]:
+def read_workbook(file_bytes: bytes, window_count: int) -> dict[str, Any]:
     """Read daily machine/window schedules from the supplied Excel workbook."""
     workbook = load_workbook(BytesIO(file_bytes), data_only=True)
 
@@ -54,6 +78,7 @@ def read_workbook(file_bytes: bytes) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "days": [day for day, _ in day_sheets],
+        "window_count": window_count,
         "sheets": {},
     }
 
@@ -75,9 +100,12 @@ def read_workbook(file_bytes: bytes) -> dict[str, Any]:
                 else worksheet.max_row
             )
 
-            machines[machine] = {1: [], 2: [], 3: [], 4: []}
+            machines[machine] = {
+                window: []
+                for window in range(1, window_count + 1)
+            }
 
-            for window in range(1, 5):
+            for window in range(1, window_count + 1):
                 column = window + 1
 
                 for row in range(start_row, end_row + 1):
@@ -141,7 +169,7 @@ def read_affected_fractions(csv_path: str, modified_ns: int) -> pd.DataFrame:
 
 
 def affected_lookup_from_dataframe(
-    affected: pd.DataFrame,
+        affected: pd.DataFrame,
 ) -> set[tuple[int, int, int, int, int]]:
     """Build exact appointment-location keys for disruption highlighting."""
     return {
@@ -230,12 +258,12 @@ def appointment_parts(raw: str) -> tuple[str, str, str]:
 
 
 def appointment_card_html(
-    card: dict[str, str],
-    *,
-    day: int,
-    machine: str,
-    window: int,
-    affected_lookup: set[tuple[int, int, int, int, int]],
+        card: dict[str, str],
+        *,
+        day: int,
+        machine: str,
+        window: int,
+        affected_lookup: set[tuple[int, int, int, int, int]],
 ) -> str:
     patient, fraction, duration = appointment_parts(card["text"])
     is_non_preferred = "NP" in card["text"].upper()
@@ -249,17 +277,17 @@ def appointment_card_html(
     machine_number = int(machine_match.group()) if machine_match else None
 
     is_affected = (
-        patient_number is not None
-        and fraction_number is not None
-        and machine_number is not None
-        and (
-            patient_number,
-            fraction_number,
-            int(day),
-            machine_number,
-            int(window),
-        )
-        in affected_lookup
+            patient_number is not None
+            and fraction_number is not None
+            and machine_number is not None
+            and (
+                patient_number,
+                fraction_number,
+                int(day),
+                machine_number,
+                int(window),
+            )
+            in affected_lookup
     )
 
     tooltip_lines = [
@@ -287,10 +315,11 @@ def appointment_card_html(
 
 
 def build_board(
-    day_data: dict[str, Any],
-    selected_day: int,
-    total_days: int,
-    affected_lookup: set[tuple[int, int, int, int, int]] | None = None,
+        day_data: dict[str, Any],
+        selected_day: int,
+        total_days: int,
+        window_count: int,
+        affected_lookup: set[tuple[int, int, int, int, int]] | None = None,
 ) -> tuple[str, int]:
     affected_lookup = affected_lookup or set()
     machines = sorted(day_data["machines"], key=natural_machine_key)
@@ -298,12 +327,12 @@ def build_board(
     total_appointments = sum(
         len(day_data["machines"][machine][window])
         for machine in machines
-        for window in range(1, 5)
+        for window in range(1, window_count + 1)
     )
     occupied_windows = sum(
         1
         for machine in machines
-        for window in range(1, 5)
+        for window in range(1, window_count + 1)
         if day_data["machines"][machine][window]
     )
 
@@ -311,7 +340,7 @@ def build_board(
         (
             f'<th><div class="machine-name">{html.escape(machine)}</div>'
             f'<div class="machine-count">'
-            f'{sum(len(day_data["machines"][machine][w]) for w in range(1, 5))} appts'
+            f'{sum(len(day_data["machines"][machine][w]) for w in range(1, window_count + 1))} appts'
             f'</div></th>'
         )
         for machine in machines
@@ -320,7 +349,7 @@ def build_board(
     rows: list[str] = []
     total_rows_height = 0
 
-    for window in range(1, 5):
+    for window in range(1, window_count + 1):
         maximum_cards = max(
             (
                 len(day_data["machines"][machine][window])
@@ -899,7 +928,7 @@ st.markdown(
       .day-slider-wrap {
         width: min(980px, 86%);
         margin: 60px auto 0;
-        
+
       }
 
       .day-slider-wrap [data-testid="stSlider"] {
@@ -987,7 +1016,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 # Discover all instances automatically from data/<instance_id>/baseline/.
 available_instances = get_available_instances()
 if not available_instances:
@@ -1017,6 +1045,12 @@ with st.sidebar:
             f"{disruption_id} — {instance_disruptions[disruption_id]['label']}"
         ),
     )
+
+try:
+    selected_window_count = window_count_from_instance(selected_instance)
+except ValueError as exc:
+    st.error(str(exc))
+    st.stop()
 
 try:
     workbook_path = build_baseline_workbook(selected_instance)
@@ -1074,16 +1108,14 @@ if st.session_state.get("workbook_identity") != workbook_identity:
     st.query_params.clear()
 
 try:
-    schedule = read_workbook(workbook_bytes)
+    schedule = read_workbook(workbook_bytes, selected_window_count)
 except Exception as exc:
     st.error(f"The workbook could not be read: {exc}")
     st.stop()
 
-
 if not schedule["days"]:
     st.error("No worksheets named Day 01, Day 02, etc. were found.")
     st.stop()
-
 
 days = schedule["days"]
 
@@ -1119,8 +1151,8 @@ if selected_view == "Disrupted" and not affected_df.empty:
 # The selected day is kept in session state and controlled by both the
 # clickable PNG side buttons and the draggable slider below the board.
 if (
-    "selected_day" not in st.session_state
-    or st.session_state["selected_day"] not in days
+        "selected_day" not in st.session_state
+        or st.session_state["selected_day"] not in days
 ):
     st.session_state["selected_day"] = days[0]
 
@@ -1131,6 +1163,7 @@ board_html, board_height = build_board(
     schedule["sheets"][selected_day],
     selected_day,
     len(days),
+    window_count=schedule["window_count"],
     affected_lookup=affected_lookup,
 )
 
@@ -1155,6 +1188,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 def go_previous() -> None:
     index = days.index(st.session_state["selected_day"])
@@ -1221,8 +1255,8 @@ else:
 
 # Synchronize the slider after side-button clicks or workbook changes.
 if (
-    "day_slider" not in st.session_state
-    or st.session_state["day_slider"] not in days
+        "day_slider" not in st.session_state
+        or st.session_state["day_slider"] not in days
 ):
     st.session_state["day_slider"] = st.session_state["selected_day"]
 

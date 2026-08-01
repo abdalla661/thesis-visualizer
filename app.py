@@ -40,28 +40,61 @@ MACHINE_RE = re.compile(r"^M\d+$", re.IGNORECASE)
 
 
 def window_count_from_instance(instance_id: str) -> int:
-    """
-    Read the number of treatment windows from an instance ID.
-
-    Expected naming pattern:
-        C3_18_2_v2_3  -> 2 windows
-        C2_18_4_v2_9  -> 4 windows
-    """
     match = re.match(r"^[^_]+_\d+_(\d+)(?:_|$)", instance_id.strip())
     if not match:
         raise ValueError(
             f"Could not determine the window count from instance ID "
-            f"'{instance_id}'. Expected a name like C3_18_2_v2_3."
+            f"'{instance_id}'."
         )
-
-    window_count = int(match.group(1))
-    if window_count not in {2, 4}:
+    count = int(match.group(1))
+    if count not in {2, 4}:
         raise ValueError(
-            f"Unsupported window count {window_count} in instance ID "
-            f"'{instance_id}'. Expected 2 or 4."
+            f"Unsupported window count {count}; expected 2 or 4."
         )
+    return count
 
-    return window_count
+
+RECOVERY_FILES = {
+    "Local Repair": (
+        "local repair",
+        "patient_local_repair_schedule.csv",
+    ),
+    "RESTORE": (
+        "restore",
+        "restore_schedule.csv",
+    ),
+    "Full Reoptimization": (
+        "full reoptimization",
+        "pure_full_reoptimization_schedule.csv",
+    ),
+}
+
+
+def recovery_schedule_path(
+        instance_id: str,
+        disruption_id: str,
+        strategy: str,
+) -> Path:
+    folder, filename = RECOVERY_FILES[strategy]
+    return (
+            APP_DIR
+            / "data"
+            / instance_id
+            / "recovery"
+            / disruption_id
+            / folder
+            / filename
+    )
+
+
+def baseline_schedule_path(instance_id: str) -> Path:
+    return (
+            APP_DIR
+            / "data"
+            / instance_id
+            / "baseline"
+            / "baseline_schedule.csv"
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -184,6 +217,285 @@ def affected_lookup_from_dataframe(
     }
 
 
+@st.cache_data(show_spinner=False)
+def read_schedule_csv(csv_path: str, modified_ns: int) -> pd.DataFrame:
+    del modified_ns
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Schedule CSV not found: {path}")
+
+    schedule = pd.read_csv(path)
+    required = {
+        "patient",
+        "fraction",
+        "machine",
+        "day",
+        "window",
+        "duration_minutes",
+        "priority",
+        "is_preferred_machine",
+    }
+    missing = required.difference(schedule.columns)
+    if missing:
+        raise ValueError(
+            "Schedule CSV is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    for column in (
+            "patient",
+            "fraction",
+            "machine",
+            "day",
+            "window",
+            "duration_minutes",
+            "priority",
+    ):
+        schedule[column] = pd.to_numeric(
+            schedule[column], errors="raise"
+        ).astype(int)
+
+    if schedule["is_preferred_machine"].dtype != bool:
+        schedule["is_preferred_machine"] = (
+            schedule["is_preferred_machine"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .map({"true": True, "false": False, "1": True, "0": False})
+        )
+
+    if schedule["is_preferred_machine"].isna().any():
+        raise ValueError(
+            "Column 'is_preferred_machine' contains unrecognised values."
+        )
+
+    return schedule.sort_values(
+        ["day", "machine", "window", "patient", "fraction"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def priority_source_color(priority: int) -> str:
+    return {
+        1: "#C6E0B4",
+        2: "#FCE4D6",
+        3: "#F4CCCC",
+    }.get(int(priority), "#C6E0B4")
+
+
+def location_tuple(row: Any) -> tuple[int, int, int]:
+    return (
+        int(row.day),
+        int(row.machine),
+        int(row.window),
+    )
+
+
+def classify_change(
+        baseline_location: tuple[int, int, int],
+        recovered_location: tuple[int, int, int],
+) -> str:
+    changed: list[str] = []
+
+    if baseline_location[0] != recovered_location[0]:
+        changed.append("day")
+    if baseline_location[1] != recovered_location[1]:
+        changed.append("machine")
+    if baseline_location[2] != recovered_location[2]:
+        changed.append("window")
+
+    if not changed:
+        return "unchanged"
+    if len(changed) > 1:
+        return "moved-multiple"
+    return f"moved-{changed[0]}"
+
+
+def dataframe_to_schedule(
+        dataframe: pd.DataFrame,
+        *,
+        window_count: int,
+        baseline: pd.DataFrame | None = None,
+        affected_keys: set[tuple[int, int]] | None = None,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    affected_keys = affected_keys or set()
+
+    baseline_by_key: dict[tuple[int, int], Any] = {}
+    if baseline is not None:
+        baseline_by_key = {
+            (int(row.patient), int(row.fraction)): row
+            for row in baseline.itertuples(index=False)
+        }
+
+    recovered_keys = {
+        (int(row.patient), int(row.fraction))
+        for row in dataframe.itertuples(index=False)
+    }
+
+    cards: list[dict[str, Any]] = []
+    metrics = {
+        "modified": 0,
+        "recovered": 0,
+        "unrecovered": 0,
+        "unchanged_affected": 0,
+        "changed_nonaffected": 0,
+        "day_changes": 0,
+        "machine_changes": 0,
+        "window_changes": 0,
+        "unchanged_total": 0,
+        "baseline_total": len(baseline_by_key),
+    }
+
+    def make_text(row: Any) -> str:
+        suffix = "" if bool(row.is_preferred_machine) else "  NP"
+        return (
+            f"P{int(row.patient):02d}  |  F{int(row.fraction)}{suffix}\n"
+            f"{int(row.duration_minutes)} min"
+        )
+
+    for row in dataframe.itertuples(index=False):
+        key = (int(row.patient), int(row.fraction))
+        recovered_location = location_tuple(row)
+        baseline_row = baseline_by_key.get(key)
+        baseline_location = (
+            location_tuple(baseline_row)
+            if baseline_row is not None
+            else recovered_location
+        )
+        raw_change = classify_change(baseline_location, recovered_location)
+        is_affected = key in affected_keys
+
+        if baseline_row is not None:
+            if raw_change == "unchanged":
+                metrics["unchanged_total"] += 1
+            else:
+                metrics["modified"] += 1
+
+                if baseline_location[0] != recovered_location[0]:
+                    metrics["day_changes"] += 1
+                if baseline_location[1] != recovered_location[1]:
+                    metrics["machine_changes"] += 1
+                if baseline_location[2] != recovered_location[2]:
+                    metrics["window_changes"] += 1
+
+        if is_affected:
+            metrics["recovered"] += 1
+            if raw_change == "unchanged":
+                status = "affected-recovered-same"
+                metrics["unchanged_affected"] += 1
+            else:
+                status = "affected-recovered-moved"
+                if baseline_row is not None:
+                    cards.append({
+                        "patient": int(baseline_row.patient),
+                        "fraction": int(baseline_row.fraction),
+                        "day": int(baseline_row.day),
+                        "machine": int(baseline_row.machine),
+                        "window": int(baseline_row.window),
+                        "text": make_text(baseline_row),
+                        "source_color": priority_source_color(int(baseline_row.priority)),
+                        "status": "affected-origin",
+                        "raw_change": raw_change,
+                        "is_affected": True,
+                        "baseline_location": baseline_location,
+                        "recovered_location": recovered_location,
+                        "is_preferred_machine": bool(baseline_row.is_preferred_machine),
+                    })
+        else:
+            if raw_change == "unchanged":
+                status = "unchanged"
+            else:
+                status = "nonaffected-changed"
+                metrics["changed_nonaffected"] += 1
+
+        cards.append({
+            "patient": int(row.patient),
+            "fraction": int(row.fraction),
+            "day": int(row.day),
+            "machine": int(row.machine),
+            "window": int(row.window),
+            "text": make_text(row),
+            "source_color": priority_source_color(int(row.priority)),
+            "status": status,
+            "raw_change": raw_change,
+            "is_affected": is_affected,
+            "baseline_location": baseline_location,
+            "recovered_location": recovered_location,
+            "is_preferred_machine": bool(row.is_preferred_machine),
+        })
+
+    if baseline is not None:
+        for key in sorted(affected_keys - recovered_keys):
+            baseline_row = baseline_by_key.get(key)
+            if baseline_row is None:
+                continue
+            metrics["unrecovered"] += 1
+            baseline_location = location_tuple(baseline_row)
+            cards.append({
+                "patient": int(baseline_row.patient),
+                "fraction": int(baseline_row.fraction),
+                "day": int(baseline_row.day),
+                "machine": int(baseline_row.machine),
+                "window": int(baseline_row.window),
+                "text": make_text(baseline_row),
+                "source_color": priority_source_color(int(baseline_row.priority)),
+                "status": "unrecovered",
+                "raw_change": "unrecovered",
+                "is_affected": True,
+                "baseline_location": baseline_location,
+                "recovered_location": None,
+                "is_preferred_machine": bool(baseline_row.is_preferred_machine),
+            })
+
+    days = sorted({int(card["day"]) for card in cards})
+    machines = sorted({int(card["machine"]) for card in cards})
+    result: dict[str, Any] = {
+        "days": days,
+        "window_count": window_count,
+        "sheets": {},
+    }
+    order = {
+        "affected-origin": 0,
+        "unrecovered": 1,
+        "affected-recovered-same": 2,
+        "affected-recovered-moved": 2,
+        "nonaffected-changed": 3,
+        "unchanged": 4,
+    }
+
+    for day in days:
+        day_machines = {
+            f"M{machine}": {w: [] for w in range(1, window_count + 1)}
+            for machine in machines
+        }
+        for card in cards:
+            if int(card["day"]) != day:
+                continue
+            machine_name = f"M{int(card['machine'])}"
+            day_machines.setdefault(
+                machine_name,
+                {w: [] for w in range(1, window_count + 1)},
+            )
+            day_machines[machine_name][int(card["window"])].append(card)
+
+        for machine_name in day_machines:
+            for window in day_machines[machine_name]:
+                day_machines[machine_name][window].sort(
+                    key=lambda card: (
+                        order.get(str(card.get("status")), 99),
+                        int(card["patient"]),
+                        int(card["fraction"]),
+                    )
+                )
+
+        result["sheets"][day] = {
+            "sheet_name": f"Day {day:02d}",
+            "machines": day_machines,
+        }
+
+    return result, metrics
+
+
 def natural_machine_key(machine: str) -> tuple[int, str]:
     match = re.search(r"\d+", machine)
     return (int(match.group()) if match else 10_000, machine)
@@ -258,25 +570,30 @@ def appointment_parts(raw: str) -> tuple[str, str, str]:
 
 
 def appointment_card_html(
-        card: dict[str, str],
+        card: dict[str, Any],
         *,
         day: int,
         machine: str,
         window: int,
         affected_lookup: set[tuple[int, int, int, int, int]],
+        disruption_day: int | None = None,
+        disruption_window: int | None = None,
+        changes_only: bool = False,
 ) -> str:
     patient, fraction, duration = appointment_parts(card["text"])
-    is_non_preferred = "NP" in card["text"].upper()
+    is_non_preferred = (
+            not bool(card.get("is_preferred_machine", True))
+            or "NP" in card["text"].upper()
+    )
 
     patient_match = re.search(r"\d+", patient)
     fraction_match = re.search(r"\d+", fraction)
     machine_match = re.search(r"\d+", machine)
-
     patient_number = int(patient_match.group()) if patient_match else None
     fraction_number = int(fraction_match.group()) if fraction_match else None
     machine_number = int(machine_match.group()) if machine_match else None
 
-    is_affected = (
+    exact_affected = (
             patient_number is not None
             and fraction_number is not None
             and machine_number is not None
@@ -286,30 +603,85 @@ def appointment_card_html(
                 int(day),
                 machine_number,
                 int(window),
-            )
-            in affected_lookup
+            ) in affected_lookup
     )
 
+    status = str(card.get("status", "unchanged"))
+    raw_change = str(card.get("raw_change", "unchanged"))
+    is_before_disruption = (
+            disruption_day is not None
+            and disruption_window is not None
+            and (
+                    int(day) < disruption_day
+                    or (int(day) == disruption_day and int(window) < disruption_window)
+            )
+    )
+
+    classes = ["appt-card", priority_class(str(card["source_color"]))]
+
+    if exact_affected and status == "unchanged":
+        classes.append("affected-card")
+
+    # The original affected position is always shown as historical context.
+    if status == "affected-origin":
+        classes.append("affected-origin")
+
+    # Toggle only the recovery comparison overlays.
+    if changes_only:
+        if status in {"affected-recovered-same", "affected-recovered-moved"}:
+            classes.append("recovered-affected")
+        elif status == "nonaffected-changed":
+            classes.append("changed-nonaffected")
+        elif status == "unrecovered":
+            classes.append("unrecovered-card")
+
+    # Historical appointments remain dimmed independently of comparison borders.
+    if is_before_disruption:
+        classes.append("pre-disruption")
+
+    baseline_location = card.get("baseline_location")
+    recovered_location = card.get("recovered_location")
     tooltip_lines = [
         f"Patient: {patient}",
         f"Fraction: {fraction}",
         f"Duration: {duration}",
     ]
-    if is_affected:
-        tooltip_lines.append("Status: Affected by disruption")
+    if baseline_location:
+        tooltip_lines.append(
+            f"Baseline: Day {baseline_location[0]} · "
+            f"M{baseline_location[1]} · W{baseline_location[2]}"
+        )
+    if recovered_location:
+        tooltip_lines.append(
+            f"Recovered: Day {recovered_location[0]} · "
+            f"M{recovered_location[1]} · W{recovered_location[2]}"
+        )
+
+    labels = {
+        "affected-origin": "Affected original position",
+        "affected-recovered-same": "Recovered in same position",
+        "affected-recovered-moved": "Affected and recovered elsewhere",
+        "nonaffected-changed": "Changed although not affected",
+        "unrecovered": "Unrecovered",
+    }
+    if status in labels:
+        tooltip_lines.append(f"Status: {labels[status]}")
+    if raw_change not in {"unchanged", "unrecovered"}:
+        tooltip_lines.append(
+            "Change: " + raw_change.replace("-", " ").title()
+        )
 
     tooltip = html.escape("\n".join(tooltip_lines), quote=True)
     patient_text = html.escape(patient)
 
-    if is_affected:
-        card_class = "affected-card"
-        badge = ""
-    else:
-        card_class = priority_class(card["source_color"])
-        badge = '<span class="np-badge">NP</span>' if is_non_preferred else ""
+    badge = (
+        '<span class="np-badge">NP</span>'
+        if is_non_preferred and status != "unrecovered"
+        else ""
+    )
 
     return (
-        f'<div class="appt-card {card_class}" title="{tooltip}">'
+        f'<div class="{" ".join(classes)}" title="{tooltip}">'
         f'{badge}<span>{patient_text}</span></div>'
     )
 
@@ -320,6 +692,10 @@ def build_board(
         total_days: int,
         window_count: int,
         affected_lookup: set[tuple[int, int, int, int, int]] | None = None,
+        disruption_day: int | None = None,
+        disruption_window: int | None = None,
+        changes_only: bool = False,
+        show_recovery_legend: bool = False,
 ) -> tuple[str, int]:
     affected_lookup = affected_lookup or set()
     machines = sorted(day_data["machines"], key=natural_machine_key)
@@ -375,6 +751,9 @@ def build_board(
                         machine=machine,
                         window=window,
                         affected_lookup=affected_lookup,
+                        disruption_day=disruption_day,
+                        disruption_window=disruption_window,
+                        changes_only=changes_only,
                     )
                     for card in cards
                 )
@@ -391,6 +770,42 @@ def build_board(
             f'<span>W{window}</span></th>'
             f'{"".join(cells)}</tr>'
         )
+
+    # Recovery status is relevant only in recovery strategy views.
+    recovery_legend_html = ""
+    if show_recovery_legend:
+        recovery_legend_html = """
+          <span class="priority-legend-title">Recovery</span>
+          <span class="priority-legend-item">
+            <i class="priority-legend-swatch"
+               style="background:#F3F4F6;
+                      border:1px solid #E5E7EB;
+                      border-left:5px solid #DC2626;">
+            </i>
+            Disrupted slot
+          </span>
+          <span class="priority-legend-item">
+            <i class="priority-legend-swatch"
+               style="background:#FFFFFF;
+                      border:4px solid #16A34A;">
+            </i>
+            Affected recovered
+          </span>
+          <span class="priority-legend-item">
+            <i class="priority-legend-swatch"
+               style="background:#FFFFFF;
+                      border:4px solid #EA580C;">
+            </i>
+            Non-affected modified
+          </span>
+          <span class="priority-legend-item">
+            <i class="priority-legend-swatch"
+               style="background:#111827;
+                      border:4px solid #000000;">
+            </i>
+            Unrecovered
+          </span>
+        """
 
     # Extra space is reserved for the compact priority legend above the table.
     component_height = 230 + total_rows_height
@@ -614,6 +1029,76 @@ def build_board(
         font-weight: 650;
       }}
 
+      .pre-disruption {{
+        opacity: .32;
+        filter: grayscale(.25) saturate(.45);
+        pointer-events: none;
+      }}
+
+      .dim-unchanged {{
+        opacity: 1;
+        filter: none;
+      }}
+
+      /* Original affected position: retain priority fill, add red border. */
+      /* Original affected position (vacated after recovery) */
+.affected-origin {{
+    background: #F3F4F6 !important;
+    color: #6B7280 !important;
+
+    border: 1px solid #E5E7EB !important;
+    border-left: 5px solid #DC2626 !important;
+
+    outline: none !important;
+    box-shadow: none !important;
+
+    opacity: 0.65;
+}}
+
+      /* Affected appointment successfully recovered: green border. */
+      .recovered-affected {{
+        outline: 4px solid #16A34A;
+        outline-offset: -4px;
+        box-shadow: 0 1px 7px rgba(22, 163, 74, .28);
+      }}
+
+      /* Non-affected appointment changed by recovery: orange border. */
+      .changed-nonaffected {{
+        outline: 4px solid #EA580C;
+        outline-offset: -4px;
+        box-shadow: 0 1px 7px rgba(234, 88, 12, .28);
+      }}
+
+      .unrecovered-card {{
+        color: #FFFFFF !important;
+        background: #111827 !important;
+        border: 4px solid #000000 !important;
+        box-shadow: 0 1px 8px rgba(0, 0, 0, .36);
+      }}
+
+      .unrecovered-card span:not(.status-badge) {{
+        color: #FFFFFF !important;
+      }}
+
+      .status-badge {{
+        position: absolute;
+        top: 2px;
+        right: 2px;
+        padding: 1px 4px;
+        color: #FFFFFF;
+        background: #F28C28;
+        border-radius: 999px;
+        font-size: 6px;
+        font-weight: 700;
+      }}
+
+      .status-badge-red {{ background: #DC2626; }}
+      .status-badge-green {{ background: #22A447; }}
+      .status-badge-black {{
+        background: #000000;
+        border: 1px solid rgba(255,255,255,.35);
+      }}
+
       .affected-badge {{
         position: absolute;
         top: 2px;
@@ -740,7 +1225,7 @@ def build_board(
       </div>
     </div>
 
-    <div class="priority-legend" aria-label="Patient priority legend">
+    <div class="priority-legend" aria-label="Schedule legend">
       <span class="priority-legend-title">Priority</span>
       <span class="priority-legend-item">
         <i class="priority-legend-swatch priority-1"></i>Priority 1
@@ -751,9 +1236,7 @@ def build_board(
       <span class="priority-legend-item">
         <i class="priority-legend-swatch priority-3"></i>Priority 3
       </span>
-      <span class="priority-legend-item">
-        <i class="priority-legend-swatch affected-legend-swatch"></i>Affected
-      </span>
+      {recovery_legend_html}
     </div>
 
     <div class="board-wrap">
@@ -924,45 +1407,92 @@ st.markdown(
         opacity: .18;
       }
 
-      /* Real draggable day slider. */
-      .day-slider-wrap {
-        width: min(980px, 86%);
-        margin: 60px auto 0;
-
+      /* Treatment-horizon navigation */
+      .st-key-treatment_horizon {
+        margin-top: 18px;
       }
 
-      .day-slider-wrap [data-testid="stSlider"] {
+      /* This app has only one day slider, so use both keyed and global
+         selectors to support different Streamlit DOM versions. */
+      .st-key-treatment_horizon [data-testid="stSlider"],
+      div[data-testid="stSlider"] {
         padding: 0 !important;
+        --primary-color: #82B2C0 !important;
+        --primary-color-rgb: 130, 178, 192 !important;
+        accent-color: #82B2C0 !important;
       }
 
-      .day-slider-wrap [data-testid="stSlider"] label {
+      .st-key-treatment_horizon [data-testid="stSlider"] label,
+      div[data-testid="stSlider"] label {
         display: none !important;
       }
 
-      .day-slider-wrap div[data-baseweb="slider"] {
+      .st-key-treatment_horizon div[data-baseweb="slider"],
+      div[data-testid="stSlider"] div[data-baseweb="slider"] {
         padding: 2px 0 8px !important;
+        --primary-color: #82B2C0 !important;
+        --primary-color-rgb: 130, 178, 192 !important;
+        accent-color: #82B2C0 !important;
       }
 
-      .day-slider-wrap div[role="slider"] {
-        width: 18px !important;
-        height: 18px !important;
-        background: #82B2C0 !important;
-        border: 3px solid #FFFFFF !important;
-        box-shadow: 0 1px 5px rgba(36,52,71,.24) !important;
+      /* Inactive track */
+      .st-key-treatment_horizon div[data-baseweb="slider"] > div,
+      div[data-testid="stSlider"] div[data-baseweb="slider"] > div {
+        background: #E5E9ED !important;
+        background-color: #E5E9ED !important;
       }
 
-      .day-slider-wrap [data-baseweb="slider"] > div > div {
+      /* Track segments */
+      .st-key-treatment_horizon div[data-baseweb="slider"] > div > div,
+      div[data-testid="stSlider"] div[data-baseweb="slider"] > div > div {
         height: 5px !important;
         border-radius: 999px !important;
       }
 
+      /* Active track: cover the BaseWeb variants used by Streamlit. */
+      .st-key-treatment_horizon div[data-baseweb="slider"] > div > div:first-child,
+      .st-key-treatment_horizon div[data-baseweb="slider"] > div > div[style],
+      div[data-testid="stSlider"] div[data-baseweb="slider"] > div > div:first-child,
+      div[data-testid="stSlider"] div[data-baseweb="slider"] > div > div[style],
+      div[data-testid="stSlider"] [role="progressbar"] {
+        background: #82B2C0 !important;
+        background-color: #82B2C0 !important;
+        border-color: #82B2C0 !important;
+      }
+
+      /* Thumb */
+      .st-key-treatment_horizon div[role="slider"],
+      div[data-testid="stSlider"] div[role="slider"] {
+        width: 18px !important;
+        height: 18px !important;
+        background: #82B2C0 !important;
+        background-color: #82B2C0 !important;
+        border: 3px solid #FFFFFF !important;
+        box-shadow: 0 1px 5px rgba(36,52,71,.24) !important;
+      }
+
+      /* The floating value above the thumb should use the same accent. */
+      .st-key-treatment_horizon [data-testid="stThumbValue"],
+      div[data-testid="stSlider"] [data-testid="stThumbValue"] {
+        color: #527F8D !important;
+        font-weight: 600 !important;
+      }
+
+      .treatment-horizon-heading {
+        margin: 0 0 6px;
+        color: #243447;
+        font-size: 13px;
+        font-weight: 750;
+        letter-spacing: .02em;
+      }
+
       .disruption-summary {
         display: grid;
-        grid-template-columns: minmax(220px, 1.7fr) repeat(5, minmax(72px, .55fr));
+        grid-template-columns: minmax(220px, 1.35fr) repeat(7, minmax(82px, .72fr));
         align-items: center;
         gap: 10px;
         margin-top: 18px;
-        margin-bottom: 18px;
+        margin-bottom: 10px;
         padding: 10px 14px;
         color: #713838;
         background: #FFF7F7;
@@ -993,21 +1523,140 @@ st.markdown(
       }
 
       .disruption-stat {
-        padding-left: 10px;
+        display: flex;
+        min-height: 58px;
+        flex-direction: column;
+        justify-content: center;
+        padding-left: 14px;
         border-left: 1px solid #F0DADA;
       }
+
+      .disruption-col-1 { grid-column: 2; }
+      .disruption-col-2 { grid-column: 3; }
+      .disruption-col-3-4 { grid-column: 4 / span 2; }
+      .disruption-col-5-6 { grid-column: 6 / span 2; }
+      .disruption-col-7 { grid-column: 8; }
 
       .disruption-stat b {
         color: #6B3333;
         font-size: 13px;
       }
 
+      .recovery-summary-flat {
+        display: grid;
+        grid-template-columns: minmax(220px, 1.35fr) repeat(7, minmax(82px, .72fr));
+        align-items: center;
+        gap: 0;
+        margin: 0 0 16px;
+        padding: 10px 14px;
+        background: #F7F8FA;
+        border: 1px solid #D7DDE4;
+        border-left: 5px solid #A8AFB7;
+        border-radius: 13px;
+        box-shadow: 0 4px 12px rgba(36, 52, 71, .04);
+      }
+
+      .recovery-summary-copy {
+        display: flex;
+        min-height: 58px;
+        flex-direction: column;
+        justify-content: center;
+        padding: 4px 18px 4px 6px;
+      }
+
+      .recovery-summary-copy span {
+        color: #7A8491;
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: .09em;
+        text-transform: uppercase;
+      }
+
+      .recovery-summary-copy strong {
+        margin-top: 6px;
+        color: #243447;
+        font-size: 19px;
+        font-weight: 800;
+        line-height: 1.05;
+      }
+
+      .recovery-flat-stat {
+        display: flex;
+        min-height: 58px;
+        flex-direction: column;
+        align-items: flex-start;
+        justify-content: center;
+        padding: 4px 14px;
+        border-left: 1px solid #D9DEE5;
+      }
+
+      .recovery-flat-stat b {
+        color: #243447;
+        font-size: 18px;
+        font-weight: 500;
+        line-height: 1;
+      }
+
+      .recovery-flat-stat span {
+        margin-top: 7px;
+        color: #747F8D;
+        font-size: 8px;
+        font-weight: 800;
+        letter-spacing: .06em;
+        text-transform: uppercase;
+      }
+
+      .recovery-rate-good {
+        color: #16A34A !important;
+        font-weight: 900 !important;
+      }
+
+      .recovery-rate-bad {
+        color: #DC2626 !important;
+        font-weight: 900 !important;
+      }
+
+      @media (max-width: 1300px) {
+        .recovery-summary-flat,
+        .disruption-summary {
+          grid-template-columns: repeat(4, 1fr);
+        }
+
+        .recovery-summary-copy,
+        .disruption-summary-copy {
+          grid-column: 1 / -1;
+          border-bottom: 1px solid #D9DEE5;
+          margin-bottom: 4px;
+        }
+
+        .recovery-flat-stat,
+        .disruption-stat {
+          grid-column: auto !important;
+          border-left: 0;
+          border-right: 1px solid #D9DEE5;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .recovery-summary-flat {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
       @media (max-width: 1050px) {
         .disruption-summary {
           grid-template-columns: repeat(3, 1fr);
         }
+
         .disruption-summary-copy {
           grid-column: 1 / -1;
+        }
+      }
+
+      @media (max-width: 700px) {
+        .recovery-kpi-panel,
+        .change-breakdown {
+          grid-template-columns: 1fr;
         }
       }
 
@@ -1024,27 +1673,53 @@ if not available_instances:
 
 with st.sidebar:
     st.header("Schedule Selection")
-    selected_instance = st.selectbox("Instance", options=available_instances)
+
+    selected_instance = st.selectbox(
+        "Instance",
+        options=available_instances,
+    )
+
     instance_disruptions = disruptions_for(selected_instance)
     available_disruptions = [
         disruption_id
         for disruption_id, details in instance_disruptions.items()
-        if Path(details["affected"]).exists() or Path(details["summary"]).exists()
+        if Path(details["affected"]).exists()
+        or Path(details["summary"]).exists()
     ]
     if not available_disruptions:
         available_disruptions = list(instance_disruptions)
-    selected_view = st.selectbox(
-        "Schedule View",
-        options=["Baseline", "Disrupted"],
-        index=0,
-    )
+
     selected_disruption = st.selectbox(
         "Disruption",
         options=available_disruptions,
         format_func=lambda disruption_id: (
-            f"{disruption_id} — {instance_disruptions[disruption_id]['label']}"
+            f"{disruption_id} — "
+            f"{instance_disruptions[disruption_id]['label']}"
         ),
     )
+
+    selected_view = st.selectbox(
+        "Schedule View",
+        options=[
+            "Baseline",
+            "Disrupted",
+            "Local Repair",
+            "RESTORE",
+            "Full Reoptimization",
+        ],
+        index=0,
+    )
+
+    changes_only = False
+    if selected_view in RECOVERY_FILES:
+        changes_only = st.checkbox(
+            "Show comparison borders",
+            value=True,
+            help=(
+                "Turn recovery comparison styling on or off. "
+                "Appointments before the disruption remain dimmed."
+            ),
+        )
 
 try:
     selected_window_count = window_count_from_instance(selected_instance)
@@ -1053,21 +1728,50 @@ except ValueError as exc:
     st.stop()
 
 try:
-    workbook_path = build_baseline_workbook(selected_instance)
-    workbook_bytes = workbook_path.read_bytes()
-    workbook_label = str(workbook_path.resolve())
+    baseline_csv = baseline_schedule_path(selected_instance)
+    baseline_df = read_schedule_csv(
+        str(baseline_csv.resolve()),
+        baseline_csv.stat().st_mtime_ns,
+    )
+
+    if selected_view in {"Baseline", "Disrupted"}:
+        workbook_path = build_baseline_workbook(selected_instance)
+        workbook_bytes = workbook_path.read_bytes()
+        workbook_label = str(workbook_path.resolve())
+        schedule = read_workbook(
+            workbook_bytes,
+            selected_window_count,
+        )
+        recovery_metrics = None
+    else:
+        recovery_path = recovery_schedule_path(
+            selected_instance,
+            selected_disruption,
+            selected_view,
+        )
+        recovery_df = read_schedule_csv(
+            str(recovery_path.resolve()),
+            recovery_path.stat().st_mtime_ns,
+        )
+        workbook_path = recovery_path
+        workbook_bytes = recovery_path.read_bytes()
+        workbook_label = str(recovery_path.resolve())
+        schedule = None
+        recovery_metrics = None
 except Exception as exc:
-    st.error(f"The baseline workbook could not be prepared: {exc}")
+    st.error(f"The selected schedule could not be prepared: {exc}")
     st.info(
-        "Check config.py, the baseline CSV, and the Excel template, then rerun the app."
+        "Check the baseline/recovery CSV paths and rerun the app."
     )
     st.stop()
 
 affected_lookup: set[tuple[int, int, int, int, int]] = set()
+affected_keys: set[tuple[int, int]] = set()
 affected_df = pd.DataFrame()
 affected_day: int | None = None
+affected_window: int | None = None
 
-if selected_view == "Disrupted":
+if selected_view != "Baseline":
     affected_path = Path(instance_disruptions[selected_disruption]["affected"])
     try:
         affected_df = read_affected_fractions(
@@ -1075,18 +1779,39 @@ if selected_view == "Disrupted":
             affected_path.stat().st_mtime_ns,
         )
         affected_lookup = affected_lookup_from_dataframe(affected_df)
+        affected_keys = {
+            (int(row.patient), int(row.fraction))
+            for row in affected_df.itertuples(index=False)
+        }
+
         if not affected_df.empty:
             affected_day = int(affected_df["day"].min())
+            first_day_rows = affected_df[
+                affected_df["day"] == affected_day
+                ]
+            affected_window = int(first_day_rows["window"].min())
     except Exception as exc:
         st.error(f"The disruption data could not be read: {exc}")
         st.stop()
 
-view_identity = f"{selected_instance}:{selected_disruption}:{selected_view}"
+if selected_view in RECOVERY_FILES:
+    try:
+        schedule, recovery_metrics = dataframe_to_schedule(
+            recovery_df,
+            window_count=selected_window_count,
+            baseline=baseline_df,
+            affected_keys=affected_keys,
+        )
+    except Exception as exc:
+        st.error(f"The recovery comparison could not be built: {exc}")
+        st.stop()
+
+view_identity = f"{selected_instance}:{selected_disruption}:{selected_view}:{changes_only}"
 if st.session_state.get("schedule_view_identity") != view_identity:
     st.session_state["schedule_view_identity"] = view_identity
     st.session_state.pop("selected_day", None)
     st.session_state.pop("day_slider", None)
-    if selected_view == "Disrupted" and affected_day is not None:
+    if selected_view != "Baseline" and affected_day is not None:
         st.session_state["selected_day"] = affected_day
         st.session_state["day_slider"] = affected_day
 
@@ -1098,7 +1823,7 @@ workbook_identity = (
 )
 if st.session_state.get("workbook_identity") != workbook_identity:
     st.session_state["workbook_identity"] = workbook_identity
-    if selected_view == "Disrupted" and affected_day is not None:
+    if selected_view != "Baseline" and affected_day is not None:
         st.session_state["selected_day"] = affected_day
         st.session_state["day_slider"] = affected_day
     else:
@@ -1107,19 +1832,13 @@ if st.session_state.get("workbook_identity") != workbook_identity:
     st.session_state.pop("bottom_day_timeline", None)
     st.query_params.clear()
 
-try:
-    schedule = read_workbook(workbook_bytes, selected_window_count)
-except Exception as exc:
-    st.error(f"The workbook could not be read: {exc}")
-    st.stop()
-
 if not schedule["days"]:
     st.error("No worksheets named Day 01, Day 02, etc. were found.")
     st.stop()
 
 days = schedule["days"]
 
-if selected_view == "Disrupted" and not affected_df.empty:
+if selected_view != "Baseline" and not affected_df.empty:
     affected_patients = int(affected_df["patient"].nunique())
     affected_fractions = int(len(affected_df))
     affected_days = sorted(affected_df["day"].unique().tolist())
@@ -1138,11 +1857,69 @@ if selected_view == "Disrupted" and not affected_df.empty:
             <strong>{html.escape(selected_disruption)} — {html.escape(disruption_label)}</strong>
             <span>Selected disruption overlay</span>
           </div>
-          <div class="disruption-stat"><b>{affected_fractions}</b><span>Fractions</span></div>
-          <div class="disruption-stat"><b>{affected_patients}</b><span>Patients</span></div>
-          <div class="disruption-stat"><b>{html.escape(days_text)}</b><span>Day</span></div>
-          <div class="disruption-stat"><b>{html.escape(machines_text)}</b><span>Machine</span></div>
-          <div class="disruption-stat"><b>{html.escape(windows_text)}</b><span>Window</span></div>
+          <div class="disruption-stat disruption-col-1"><b>{affected_fractions}</b><span>Fractions</span></div>
+          <div class="disruption-stat disruption-col-2"><b>{affected_patients}</b><span>Patients</span></div>
+          <div class="disruption-stat disruption-col-3-4"><b>{html.escape(days_text)}</b><span>Day</span></div>
+          <div class="disruption-stat disruption-col-5-6"><b>{html.escape(machines_text)}</b><span>Machine</span></div>
+          <div class="disruption-stat disruption-col-7"><b>{html.escape(windows_text)}</b><span>Window</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+if selected_view in RECOVERY_FILES and recovery_metrics is not None:
+    affected_count = len(affected_keys)
+    recovered_count = recovery_metrics["recovered"]
+    recovery_rate = (
+        100.0 * recovered_count / affected_count
+        if affected_count
+        else 0.0
+    )
+
+    st.markdown(
+        f"""
+        <div class="recovery-summary-flat">
+          <div class="recovery-summary-copy">
+            <span>Recovery method</span>
+            <strong>{html.escape(selected_view)}</strong>
+          </div>
+
+          <div class="recovery-flat-stat">
+            <b>{recovered_count}</b>
+            <span>Recovered</span>
+          </div>
+
+          <div class="recovery-flat-stat">
+            <b>{recovery_metrics['unrecovered']}</b>
+            <span>Not recovered</span>
+          </div>
+
+          <div class="recovery-flat-stat recovery-rate-stat">
+            <b class="{'recovery-rate-good' if recovery_rate == 100 else 'recovery-rate-bad'}">
+              {f'{recovery_rate:.0f}%' if recovery_rate.is_integer() else f'{recovery_rate:.1f}%'}
+            </b>
+            <span>Recovery rate</span>
+          </div>
+
+          <div class="recovery-flat-stat">
+            <b>{recovery_metrics['modified']}</b>
+            <span>Modified</span>
+          </div>
+
+          <div class="recovery-flat-stat">
+            <b>{recovery_metrics['day_changes']}</b>
+            <span>Day</span>
+          </div>
+
+          <div class="recovery-flat-stat">
+            <b>{recovery_metrics['machine_changes']}</b>
+            <span>Machine</span>
+          </div>
+
+          <div class="recovery-flat-stat">
+            <b>{recovery_metrics['window_changes']}</b>
+            <span>Window</span>
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1165,6 +1942,10 @@ board_html, board_height = build_board(
     len(days),
     window_count=schedule["window_count"],
     affected_lookup=affected_lookup,
+    disruption_day=affected_day,
+    disruption_window=affected_window,
+    changes_only=changes_only,
+    show_recovery_legend=selected_view in RECOVERY_FILES,
 )
 
 left_chevron_path = first_existing_path(LEFT_CHEVRON_CANDIDATES)
@@ -1204,54 +1985,45 @@ def go_next() -> None:
         st.session_state["day_slider"] = days[index + 1]
 
 
-if selected_view == "Disrupted":
-    # A disrupted scenario opens directly on its affected day, so side arrows
-    # are intentionally hidden to keep attention on the impacted schedule.
+# Keep day-navigation arrows in every view for a consistent workflow.
+arrow_top_space = max(250, int(board_height * 0.52) - 55)
+left_column, board_column, right_column = st.columns(
+    [0.75, 14.5, 0.75],
+    gap="small",
+)
+
+with left_column:
+    st.markdown(
+        f'<div style="height:{arrow_top_space}px"></div>',
+        unsafe_allow_html=True,
+    )
+    st.button(
+        "Previous day",
+        key="side_previous_day",
+        on_click=go_previous,
+        disabled=current_index == 0,
+        use_container_width=True,
+    )
+
+with board_column:
     st.components.v1.html(
         board_html,
         height=board_height,
         scrolling=False,
     )
-else:
-    # Position the arrows at the vertical middle of the baseline schedule.
-    arrow_top_space = max(250, int(board_height * 0.52) - 55)
-    left_column, board_column, right_column = st.columns(
-        [0.75, 14.5, 0.75],
-        gap="small",
+
+with right_column:
+    st.markdown(
+        f'<div style="height:{arrow_top_space}px"></div>',
+        unsafe_allow_html=True,
     )
-
-    with left_column:
-        st.markdown(
-            f'<div style="height:{arrow_top_space}px"></div>',
-            unsafe_allow_html=True,
-        )
-        st.button(
-            "Previous day",
-            key="side_previous_day",
-            on_click=go_previous,
-            disabled=current_index == 0,
-            use_container_width=True,
-        )
-
-    with board_column:
-        st.components.v1.html(
-            board_html,
-            height=board_height,
-            scrolling=False,
-        )
-
-    with right_column:
-        st.markdown(
-            f'<div style="height:{arrow_top_space}px"></div>',
-            unsafe_allow_html=True,
-        )
-        st.button(
-            "Next day",
-            key="side_next_day",
-            on_click=go_next,
-            disabled=current_index == len(days) - 1,
-            use_container_width=True,
-        )
+    st.button(
+        "Next day",
+        key="side_next_day",
+        on_click=go_next,
+        disabled=current_index == len(days) - 1,
+        use_container_width=True,
+    )
 
 # Synchronize the slider after side-button clicks or workbook changes.
 if (
@@ -1260,15 +2032,26 @@ if (
 ):
     st.session_state["day_slider"] = st.session_state["selected_day"]
 
-st.markdown('<div class="day-slider-wrap">', unsafe_allow_html=True)
-slider_day = st.select_slider(
-    "Schedule day",
-    options=days,
-    key="day_slider",
-    format_func=lambda day: f"Day {day:02d}",
-    label_visibility="collapsed",
-)
-st.markdown('</div>', unsafe_allow_html=True)
+with st.container(key="treatment_horizon"):
+    horizon_left, horizon_center, horizon_right = st.columns(
+        [0.75, 14.5, 0.75],
+        gap="small",
+    )
+
+    with horizon_center:
+        st.markdown(
+            '<div class="treatment-horizon-heading">'
+            'Treatment Horizon'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        slider_day = st.select_slider(
+            "Schedule day",
+            options=days,
+            key="day_slider",
+            format_func=lambda day: f"Day {day:02d}",
+            label_visibility="collapsed",
+        )
 
 if slider_day != st.session_state["selected_day"]:
     st.session_state["selected_day"] = slider_day

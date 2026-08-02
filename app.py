@@ -1257,6 +1257,13 @@ def build_board(
 st.markdown(
     """
     <style>
+      /* Keep the original layout while displaying the main area at 75% zoom. */
+      [data-testid="stMainBlockContainer"] {
+        zoom: 0.75;
+        width: 133.333333% !important;
+        max-width: 133.333333% !important;
+      }
+
       .block-container {
         max-width: 100% !important;
         width: 100% !important;
@@ -1319,6 +1326,28 @@ st.markdown(
 
       [data-testid="stHeader"] {
         background: transparent;
+      }
+
+      /* Vertical schedule-view selector */
+      [data-testid="stSidebar"] [data-testid="stRadio"] > label {
+        margin-bottom: 6px;
+        color: #243447;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      [data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] {
+        gap: 4px;
+      }
+
+      [data-testid="stSidebar"] [data-testid="stRadio"] label[data-baseweb="radio"] {
+        margin: 0;
+        padding: 5px 7px;
+        border-radius: 7px;
+      }
+
+      [data-testid="stSidebar"] [data-testid="stRadio"] label[data-baseweb="radio"]:hover {
+        background: rgba(130, 178, 192, .08);
       }
 
       .timeline-shell {
@@ -1698,7 +1727,7 @@ with st.sidebar:
         ),
     )
 
-    selected_view = st.selectbox(
+    selected_view = st.radio(
         "Schedule View",
         options=[
             "Baseline",
@@ -1708,6 +1737,7 @@ with st.sidebar:
             "Full Reoptimization",
         ],
         index=0,
+        key="schedule_view",
     )
 
     changes_only = False

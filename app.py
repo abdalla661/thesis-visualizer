@@ -1539,14 +1539,14 @@ st.markdown(
 
       .disruption-summary-copy strong {
         color: #553131;
-        font-size: 14px;
+        font-size: 18px;
       }
 
       .disruption-summary-copy span,
       .disruption-stat span {
         margin-top: 2px;
         color: #966D6D;
-        font-size: 10px;
+        font-size: 15px;
         text-transform: uppercase;
         letter-spacing: .05em;
       }
@@ -1568,7 +1568,7 @@ st.markdown(
 
       .disruption-stat b {
         color: #6B3333;
-        font-size: 13px;
+        font-size: 16px;
       }
 
       .recovery-summary-flat {
@@ -1595,7 +1595,7 @@ st.markdown(
 
       .recovery-summary-copy span {
         color: #7A8491;
-        font-size: 9px;
+        font-size: 10px;
         font-weight: 800;
         letter-spacing: .09em;
         text-transform: uppercase;
@@ -1629,7 +1629,7 @@ st.markdown(
       .recovery-flat-stat span {
         margin-top: 7px;
         color: #747F8D;
-        font-size: 8px;
+        font-size: 14px;
         font-weight: 800;
         letter-spacing: .06em;
         text-transform: uppercase;
@@ -1933,7 +1933,7 @@ if selected_view in RECOVERY_FILES and recovery_metrics is not None:
 
           <div class="recovery-flat-stat">
             <b>{recovery_metrics['modified']}</b>
-            <span>Modified</span>
+            <span>Modifications</span>
           </div>
 
           <div class="recovery-flat-stat">
